@@ -36,11 +36,10 @@ pip install pywin32 psutil pystray pillow
 
 # Usage
 
-Run the main script:
-
-python all_seeing_eye.py
+Run the exe
 
 The GUI will open showing tracked applications and usage.
+
 # How It Works
 
     The app uses Windows API via pywin32 to get the currently active window's process name.
