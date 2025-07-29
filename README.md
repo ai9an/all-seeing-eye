@@ -24,7 +24,7 @@ Features
 
     Thread-safe background tracking loop
 
-Installation
+# Installation
 
     Clone or download the repository.
 
@@ -34,14 +34,14 @@ Installation
 
 pip install pywin32 psutil pystray pillow
 
-Usage
+# Usage
 
 Run the main script:
 
 python all_seeing_eye.py
 
 The GUI will open showing tracked applications and usage.
-How It Works
+# How It Works
 
     The app uses Windows API via pywin32 to get the currently active window's process name.
 
@@ -57,7 +57,7 @@ How It Works
 
     The app supports minimizing to the system tray with a context menu.
 
-Configuration
+# Configuration
 
     Whitelist apps via GUI by adding/removing .exe files.
 
@@ -67,7 +67,7 @@ Configuration
 
     All settings are persisted in settings.json.
 
-Dependencies
+# Dependencies
 
     Python 3.8+
 
