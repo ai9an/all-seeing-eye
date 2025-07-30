@@ -7,11 +7,25 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 import win32gui
 import win32process
+import win32event
+import win32api
+import winerror
 import psutil
 import pystray
 from PIL import Image
 import ctypes
 from pathlib import Path
+
+def get_tray_image():
+    if ICON_PATH.exists():
+        try:
+            return Image.open(str(ICON_PATH)).resize((64, 64), Image.LANCZOS)
+        except:
+            pass
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rectangle([8, 8, 56, 56], outline=(0, 0, 0, 255))
+    return img
 
 def get_appdata_folder():
     if sys.platform == "win32":
@@ -24,42 +38,78 @@ def get_appdata_folder():
 
 APPDATA_DIR = get_appdata_folder()
 DATA_FILE = APPDATA_DIR / "data.json"
+DATA_BAK = APPDATA_DIR / "data.json.bak"
 SETTINGS_FILE = APPDATA_DIR / "settings.json"
+SETTINGS_BAK = APPDATA_DIR / "settings.json.bak"
 LAST_USED_FILE = APPDATA_DIR / "last_used.json"
+LAST_USED_BAK = APPDATA_DIR / "last_used.json.bak"
 ICON_PATH = Path(sys._MEIPASS, "trayicon.ico") if hasattr(sys, "_MEIPASS") else Path("trayicon.ico")
 TRACK_INTERVAL = 1
+SAVE_INTERVAL = 5
 
-def get_active_app():
-    try:
-        hwnd = win32gui.GetForegroundWindow()
-        _, pid = win32process.GetWindowThreadProcessId(hwnd)
-        process = psutil.Process(pid)
-        return process.name()
-    except Exception:
-        return None
-
-def load_json(path: Path):
+def atomic_write_json(path: Path, data, bak_path: Path):
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
     if path.exists():
         try:
-            with path.open("r", encoding="utf-8") as f:
-                s = f.read().strip()
-                if not s:
-                    return {}
-                return json.loads(s)
-        except Exception:
-            return {}
+            if bak_path:
+                try:
+                    if bak_path.exists():
+                        bak_path.unlink()
+                except:
+                    pass
+                try:
+                    os.replace(path, bak_path)
+                except:
+                    pass
+        except:
+            pass
+    os.replace(tmp_path, path)
+
+def load_json_with_backup(path: Path, bak_path: Path):
+    def _read(p: Path):
+        try:
+            if not p.exists():
+                return None
+            s = p.read_text(encoding="utf-8").strip()
+            if not s:
+                return None
+            return json.loads(s)
+        except:
+            return None
+    data = _read(path)
+    if data is not None:
+        return data
+    data = _read(bak_path)
+    if data is not None:
+        try:
+            atomic_write_json(path, data, bak_path)
+        except:
+            pass
+        return data
     return {}
 
-def save_json(path: Path, data):
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f)
+def _startup_shortcut_path():
+    return Path(os.getenv("APPDATA")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup" / "AllSeeingEye.lnk"
+
+def _get_startup_command_parts():
+    if getattr(sys, "frozen", False):
+        return str(sys.executable), ""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    py = pythonw if pythonw.exists() else Path(sys.executable)
+    script = str(Path(__file__).resolve())
+    return str(py), f'"{script}"'
 
 def is_startup_enabled(user=True):
+    if user:
+        return _startup_shortcut_path().exists()
     try:
         import winreg
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        root = winreg.HKEY_CURRENT_USER if user else winreg.HKEY_LOCAL_MACHINE
-        with winreg.OpenKey(root, key_path, 0, winreg.KEY_READ) as key:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_READ) as key:
             try:
                 _ = winreg.QueryValueEx(key, "AllSeeingEye")
                 return True
@@ -68,38 +118,127 @@ def is_startup_enabled(user=True):
     except Exception:
         return False
 
-def set_startup(enable, user=True):
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+def relaunch_as_admin_with_task(task):
+    params = []
+    for a in sys.argv[1:]:
+        if not a.startswith("--apply-startup="):
+            params.append(a)
+    params.append(f"--apply-startup={task}")
+    param_str = " ".join(f'"{p}"' if " " in p and not (p.startswith('"') and p.endswith('"')) else p for p in params)
+    try:
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, param_str, None, 1)
+        return True
+    except:
+        return False
+
+def set_startup_hklm_no_elev(enable):
     try:
         import winreg
         key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
-        root = winreg.HKEY_CURRENT_USER if user else winreg.HKEY_LOCAL_MACHINE
-        with winreg.OpenKey(root, key_path, 0, winreg.KEY_WRITE) as key:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_WRITE) as key:
             if enable:
-                exe_path = sys.executable
-                winreg.SetValueEx(key, "AllSeeingEye", 0, winreg.REG_SZ, f'"{exe_path}"')
+                target, args = _get_startup_command_parts()
+                cmd = f'"{target}" {args}'.strip()
+                winreg.SetValueEx(key, "AllSeeingEye", 0, winreg.REG_SZ, cmd)
             else:
                 try:
                     winreg.DeleteValue(key, "AllSeeingEye")
                 except FileNotFoundError:
                     pass
     except Exception as e:
-        messagebox.showerror("Startup Setting Error", f"Error setting startup: {e}")
+        try:
+            messagebox.showerror("Startup Setting Error", f"Error setting startup: {e}")
+        except:
+            pass
+
+def set_startup(enable, user=True):
+    if user:
+        lnk = _startup_shortcut_path()
+        if enable:
+            try:
+                import win32com.client
+                target, args = _get_startup_command_parts()
+                shell = win32com.client.Dispatch("WScript.Shell")
+                shortcut = shell.CreateShortcut(str(lnk))
+                shortcut.TargetPath = target
+                shortcut.Arguments = args
+                shortcut.WorkingDirectory = str(Path(target).parent if getattr(sys, "frozen", False) else Path(__file__).parent)
+                icon = str(ICON_PATH if ICON_PATH.exists() else target)
+                shortcut.IconLocation = icon
+                shortcut.Save()
+            except Exception as e:
+                try:
+                    messagebox.showerror("Startup Setting Error", f"Error setting startup: {e}")
+                except:
+                    pass
+        else:
+            try:
+                if lnk.exists():
+                    lnk.unlink()
+            except:
+                pass
+        return
+    if not is_admin():
+        task = "hklm_on" if enable else "hklm_off"
+        if relaunch_as_admin_with_task(task):
+            return
+        else:
+            try:
+                messagebox.showerror("Admin Required", "You must run as administrator to set startup for all users.")
+            except:
+                pass
+            return
+    set_startup_hklm_no_elev(enable)
+
+def ensure_single_instance():
+    h_mutex = win32event.CreateMutex(None, False, "Global\\AllSeeingEyeMutex")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        try:
+            messagebox.showinfo("AllSeeingEye", "Already running.")
+        except:
+            pass
+        sys.exit(0)
+    return h_mutex
 
 class AppTracker:
     def __init__(self):
         self.running = True
-        self.data = load_json(DATA_FILE)
-        self.settings = load_json(SETTINGS_FILE)
+        self.data = load_json_with_backup(DATA_FILE, DATA_BAK)
+        self.settings = load_json_with_backup(SETTINGS_FILE, SETTINGS_BAK)
         self.recent_apps = []
         self.current_app = None
         self.start_time = time.time()
         self.lock = threading.Lock()
-        self.last_used = load_json(LAST_USED_FILE)
+        self.last_used = load_json_with_backup(LAST_USED_FILE, LAST_USED_BAK)
         self.whitelist = set(self.settings.get("whitelist", []))
         self.idle_threshold = 300
+        self._dirty_data = False
+        self._dirty_settings = False
+        self._dirty_last_used = False
+        self._last_save = time.time()
 
     def start(self):
         threading.Thread(target=self.track_loop, daemon=True).start()
+
+    def _maybe_save(self, force=False):
+        now = time.time()
+        if force or (now - self._last_save) >= SAVE_INTERVAL:
+            if self._dirty_data:
+                atomic_write_json(DATA_FILE, self.data, DATA_BAK)
+                self._dirty_data = False
+            if self._dirty_last_used:
+                atomic_write_json(LAST_USED_FILE, self.last_used, LAST_USED_BAK)
+                self._dirty_last_used = False
+            if self._dirty_settings:
+                atomic_write_json(SETTINGS_FILE, self.settings, SETTINGS_BAK)
+                self._dirty_settings = False
+            self._last_save = now
 
     def track_loop(self):
         class LASTINPUTINFO(ctypes.Structure):
@@ -123,6 +262,8 @@ class AppTracker:
                             if self.current_app not in self.recent_apps:
                                 self.recent_apps.insert(0, self.current_app)
                                 self.recent_apps = self.recent_apps[:3]
+                            self._dirty_data = True
+                            self._dirty_last_used = True
                         self.current_app = "Idle Time"
                         self.start_time = now
                 else:
@@ -136,11 +277,11 @@ class AppTracker:
                                 if self.current_app not in self.recent_apps:
                                     self.recent_apps.insert(0, self.current_app)
                                     self.recent_apps = self.recent_apps[:3]
+                                self._dirty_data = True
+                                self._dirty_last_used = True
                             self.current_app = app
                             self.start_time = now
-            save_json(DATA_FILE, self.data)
-            save_json(LAST_USED_FILE, self.last_used)
-            save_json(SETTINGS_FILE, self.settings)
+            self._maybe_save(False)
             time.sleep(TRACK_INTERVAL)
 
     def stop(self):
@@ -154,9 +295,9 @@ class AppTracker:
                 if self.current_app not in self.recent_apps:
                     self.recent_apps.insert(0, self.current_app)
                     self.recent_apps = self.recent_apps[:3]
-        save_json(DATA_FILE, self.data)
-        save_json(LAST_USED_FILE, self.last_used)
-        save_json(SETTINGS_FILE, self.settings)
+                self._dirty_data = True
+                self._dirty_last_used = True
+        self._maybe_save(True)
 
 class TrackerGUI:
     def __init__(self, tracker):
@@ -218,9 +359,9 @@ class TrackerGUI:
 
     def update_ui(self):
         self.tracker.lock.acquire()
-        recent = self.tracker.recent_apps
-        data = self.tracker.data
-        last_used = self.tracker.last_used
+        recent = list(self.tracker.recent_apps)
+        data = dict(self.tracker.data)
+        last_used = dict(self.tracker.last_used)
         self.tracker.lock.release()
         for i in range(3):
             if i < len(recent):
@@ -272,7 +413,8 @@ class TrackerGUI:
         self.tracker.settings["dark_mode"] = self.var_dark_mode.get()
         self.tracker.settings["start_minimized"] = self.var_start_minimized.get()
         self.tracker.settings["whitelist"] = list(self.tracker.whitelist)
-        save_json(SETTINGS_FILE, self.tracker.settings)
+        self.tracker._dirty_settings = False
+        atomic_write_json(SETTINGS_FILE, self.tracker.settings, SETTINGS_BAK)
 
     def toggle_dark_mode(self):
         enabled = self.var_dark_mode.get()
@@ -315,10 +457,16 @@ class TrackerGUI:
 
     def toggle_startup_user(self):
         enable = bool(self.var_startup_user.get())
+        if enable and self.var_startup_all.get() == 1:
+            self.var_startup_all.set(0)
+            set_startup(False, user=False)
         set_startup(enable, user=True)
 
     def toggle_startup_all(self):
         enable = bool(self.var_startup_all.get())
+        if enable and self.var_startup_user.get() == 1:
+            self.var_startup_user.set(0)
+            set_startup(False, user=True)
         set_startup(enable, user=False)
 
     def get_tray_title(self):
@@ -369,7 +517,28 @@ class TrackerGUI:
     def run(self):
         self.root.mainloop()
 
+def get_active_app():
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        process = psutil.Process(pid)
+        return process.name()
+    except Exception:
+        return None
+
+def apply_startup_task_arg_if_present():
+    for a in sys.argv[1:]:
+        if a.startswith("--apply-startup="):
+            v = a.split("=", 1)[1]
+            if v == "hklm_on":
+                set_startup_hklm_no_elev(True)
+            elif v == "hklm_off":
+                set_startup_hklm_no_elev(False)
+            sys.exit(0)
+
 if __name__ == "__main__":
+    apply_startup_task_arg_if_present()
+    _mutex = ensure_single_instance()
     tracker = AppTracker()
     tracker.start()
     gui = TrackerGUI(tracker)
