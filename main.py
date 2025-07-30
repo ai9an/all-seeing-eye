@@ -12,7 +12,7 @@ import win32api
 import winerror
 import psutil
 import pystray
-from PIL import Image
+from PIL import Image, ImageDraw
 import ctypes
 from pathlib import Path
 
@@ -376,16 +376,49 @@ class TrackerGUI:
         self.root.after(1000, self.update_ui)
 
     def export_data(self):
+        def fmt_ago(now_ts, last_ts):
+            if not last_ts:
+                return "Never"
+            diff = max(0, now_ts - last_ts)
+            if diff < 60:
+                return f"{int(diff)} seconds ago"
+            if diff < 3600:
+                return f"{int(diff // 60)} minutes ago"
+            if diff < 86400:
+                return f"{int(diff // 3600)} hours ago"
+            return f"{int(diff // 86400)} days ago"
+
+        sort_by_most_used = messagebox.askyesno(
+            "Export Sort",
+            "Sort by most used?\nYes = Most used\nNo = Last used"
+        )
+
         filepath = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt")])
-        if filepath:
-            with open(filepath, "w", encoding="utf-8") as f:
-                self.tracker.lock.acquire()
-                for app, seconds in sorted(self.tracker.data.items(), key=lambda x: -x[1]):
-                    time_str = time.strftime("%H:%M:%S", time.gmtime(int(seconds)))
-                    last_used_ts = self.tracker.last_used.get(app)
-                    last_used_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_used_ts)) if last_used_ts else "Never"
-                    f.write(f"{app}: {time_str} (Last used: {last_used_str})\n")
-                self.tracker.lock.release()
+        if not filepath:
+            return
+
+        now = time.time()
+        self.tracker.lock.acquire()
+        seconds_map = dict(self.tracker.data)
+        last_used_map = dict(self.tracker.last_used)
+        self.tracker.lock.release()
+
+        if sort_by_most_used:
+            order = [k for k, _ in sorted(seconds_map.items(), key=lambda x: -x[1])]
+        else:
+            order = sorted(seconds_map.keys(), key=lambda a: last_used_map.get(a, 0), reverse=True)
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            for app in order:
+                seconds = int(seconds_map.get(app, 0))
+                time_str = time.strftime("%H:%M:%S", time.gmtime(seconds))
+                ts = last_used_map.get(app)
+                if ts:
+                    last_used_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+                    ago_str = fmt_ago(now, ts)
+                    f.write(f"{app}: {time_str} (Last used: {last_used_str} | {ago_str})\n")
+                else:
+                    f.write(f"{app}: {time_str} (Last used: Never)\n")
 
     def add_whitelist(self):
         file_path = filedialog.askopenfilename(title="Select EXE", filetypes=[("Executables", "*.exe")])
